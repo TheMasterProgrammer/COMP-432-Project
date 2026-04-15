@@ -44,12 +44,12 @@ try:
     from solders.transaction import VersionedTransaction
     SOLANA_SDK_AVAILABLE = True
 except Exception:
-    Client = Any  # type: ignore[assignment]
-    TxOpts = Any  # type: ignore[assignment]
-    Keypair = Any  # type: ignore[assignment]
-    Pubkey = Any  # type: ignore[assignment]
-    VersionedTransaction = Any  # type: ignore[assignment]
-    MessageV0 = Any  # type: ignore[assignment]
+    Client = Any  
+    TxOpts = Any 
+    Keypair = Any 
+    Pubkey = Any 
+    VersionedTransaction = Any  
+    MessageV0 = Any 
     SOLANA_SDK_AVAILABLE = False
 
 
@@ -847,12 +847,50 @@ def choose_micro_lamports_price(
     snapshot: NetworkSnapshot,
     cu_limit: int,
     fee_cap_lamports: int,
+    pricing_policy: str = "sample_under_cap",
 ) -> int:
-    ratios = [0.55, 0.75, 0.90, 1.00, 1.15, 1.35, 1.60]
-    weights = [0.05, 0.12, 0.18, 0.24, 0.18, 0.14, 0.09]
-    target_price = max(1, int(round(snapshot.recent_fee_p90 * rng.choices(ratios, weights=weights, k=1)[0])))
+    """
+    Choose a CU price in micro-lamports.
+
+    pricing_policy:
+        - "recent_fee": original behavior, based on recent_fee_p90 and capped
+        - "sample_under_cap": sample a target priority fee under the hard cap
+        - "cap_max": always push as high as possible under the cap
+    """
     max_price_from_cap = max(1, int(math.floor(fee_cap_lamports * 1_000_000 / cu_limit)))
-    return int(min(target_price, max_price_from_cap))
+
+    if pricing_policy == "recent_fee":
+        ratios = [0.55, 0.75, 0.90, 1.00, 1.15, 1.35, 1.60]
+        weights = [0.05, 0.12, 0.18, 0.24, 0.18, 0.14, 0.09]
+        target_price = max(
+            1,
+            int(round(snapshot.recent_fee_p90 * rng.choices(ratios, weights=weights, k=1)[0])),
+        )
+        return int(min(target_price, max_price_from_cap))
+
+    if pricing_policy == "cap_max":
+        return int(max_price_from_cap)
+
+    if pricing_policy == "sample_under_cap":
+        target_priority_fee_lamports = rng.choices(
+            population=[
+                max(1, int(round(fee_cap_lamports * 0.10))),
+                max(1, int(round(fee_cap_lamports * 0.25))),
+                max(1, int(round(fee_cap_lamports * 0.50))),
+                max(1, int(round(fee_cap_lamports * 0.75))),
+                max(1, int(round(fee_cap_lamports * 1.00))),
+            ],
+            weights=[0.12, 0.18, 0.30, 0.24, 0.16],
+            k=1,
+        )[0]
+
+        target_price = max(
+            1,
+            int(math.floor(target_priority_fee_lamports * 1_000_000 / cu_limit)),
+        )
+        return int(min(target_price, max_price_from_cap))
+
+    raise ValueError(f"Unsupported pricing_policy: {pricing_policy}")
 
 
 def build_transaction(
@@ -961,6 +999,7 @@ def collect_real_transactions(
     sleep_seconds: float = 1.0,
     random_seed: int = 42,
     print_progress: bool = True,
+    pricing_policy: str = "sample_under_cap",
 ) -> Path:
     """Collect a real transaction dataset and append rows to a CSV file."""
     ensure_solana_sdk()
@@ -974,6 +1013,7 @@ def collect_real_transactions(
     fieldnames = [
         "timestamp_utc",
         "send_method",
+        "pricing_policy",
         "cu_limit",
         "cu_price_micro_lamports",
         "priority_fee_lamports",
@@ -1004,7 +1044,13 @@ def collect_real_transactions(
     for idx in range(num_samples):
         snapshot = rpc.snapshot_network()
         cu_limit = choose_cu_limit(rng)
-        cu_price = choose_micro_lamports_price(rng, snapshot, cu_limit, fee_cap_lamports)
+        cu_price = choose_micro_lamports_price(
+            rng=rng,
+            snapshot=snapshot,
+            cu_limit=cu_limit,
+            fee_cap_lamports=fee_cap_lamports,
+            pricing_policy=pricing_policy,
+        )
         priority_fee = compute_priority_fee_lamports(cu_limit, cu_price)
 
         latest_blockhash_resp = client.get_latest_blockhash()
@@ -1041,6 +1087,7 @@ def collect_real_transactions(
         row = {
             "timestamp_utc": sent_at_utc,
             "send_method": "rpc",
+            "pricing_policy": pricing_policy,
             "cu_limit": cu_limit,
             "cu_price_micro_lamports": cu_price,
             "priority_fee_lamports": priority_fee,
@@ -1124,6 +1171,11 @@ def cli_main() -> None:
     collect_parser.add_argument("--timeout-seconds", default=45.0, type=float)
     collect_parser.add_argument("--sleep-seconds", default=1.0, type=float)
     collect_parser.add_argument("--random-seed", default=42, type=int)
+    collect_parser.add_argument(
+        "--pricing-policy",
+        default="sample_under_cap",
+        choices=["recent_fee", "sample_under_cap", "cap_max"],
+    )
 
     prep_parser = subparsers.add_parser("prepare-real-data", help="Validate and prepare real_transactions.csv.")
     prep_parser.add_argument("--input", default="real_transactions.csv", type=Path)
@@ -1148,6 +1200,7 @@ def cli_main() -> None:
             timeout_seconds=args.timeout_seconds,
             sleep_seconds=args.sleep_seconds,
             random_seed=args.random_seed,
+            pricing_policy=args.pricing_policy,
         )
         print(f"Appended data to: {output}")
     elif args.command == "prepare-real-data":
