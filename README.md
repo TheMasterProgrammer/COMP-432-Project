@@ -1,4 +1,4 @@
-# COMP 432 Project Package
+# COMP 432 Project 
 
 ## Project title
 Fee-Capped Transaction Landing Prediction on Solana Blockchain: Learning a Low-Latency Sender Policy
