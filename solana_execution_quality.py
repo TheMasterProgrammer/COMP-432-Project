@@ -37,6 +37,7 @@ try:
     from solana.rpc.api import Client
     from solana.rpc.types import TxOpts
     from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
+    from solders.instruction import Instruction
     from solders.keypair import Keypair
     from solders.message import MessageV0
     from solders.pubkey import Pubkey
@@ -46,6 +47,7 @@ try:
 except Exception:
     Client = Any  
     TxOpts = Any 
+    Instruction = Any
     Keypair = Any 
     Pubkey = Any 
     VersionedTransaction = Any  
@@ -62,12 +64,19 @@ BASE_NUMERIC_FEATURES = [
     "recent_fee_median",
     "recent_fee_p90",
     "recent_fee_max",
+    "local_recent_fee_min",
+    "local_recent_fee_median",
+    "local_recent_fee_p90",
+    "local_recent_fee_max",
     "recent_tps",
     "recent_slots_per_second",
     "message_size_bytes",
     "instruction_count",
     "account_count",
     "writable_account_count",
+    "memo_size_bytes",
+    "extra_transfer_count",
+    "lamports",
     "time_of_day_sin",
     "time_of_day_cos",
     "day_of_week",
@@ -75,11 +84,15 @@ BASE_NUMERIC_FEATURES = [
 
 BASE_CATEGORICAL_FEATURES = [
     "send_method",
+    "pricing_policy",
+    "tx_variant",
 ]
 
 REAL_DATA_REQUIRED_COLUMNS = [
     "timestamp_utc",
     "send_method",
+    "pricing_policy",
+    "tx_variant",
     "cu_limit",
     "cu_price_micro_lamports",
     "priority_fee_lamports",
@@ -88,12 +101,19 @@ REAL_DATA_REQUIRED_COLUMNS = [
     "recent_fee_median",
     "recent_fee_p90",
     "recent_fee_max",
+    "local_recent_fee_min",
+    "local_recent_fee_median",
+    "local_recent_fee_p90",
+    "local_recent_fee_max",
     "recent_tps",
     "recent_slots_per_second",
     "message_size_bytes",
     "instruction_count",
     "account_count",
     "writable_account_count",
+    "memo_size_bytes",
+    "extra_transfer_count",
+    "lamports",
     "landed_within_1_slots",
     "landed_within_2_slots",
     "landed_within_3_slots",
@@ -130,6 +150,115 @@ class NetworkSnapshot:
     recent_fee_max: float
     recent_tps: float
     recent_slots_per_second: float
+
+
+MEMO_PROGRAM_ID = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+
+
+def build_memo_instruction(memo_text: str) -> Instruction:
+    """Build a Solana memo instruction."""
+    ensure_solana_sdk()
+    return Instruction(
+        program_id=Pubkey.from_string(MEMO_PROGRAM_ID),
+        accounts=[],
+        data=memo_text.encode("utf-8"),
+    )
+
+
+def choose_fee_cap_lamports(rng: random.Random) -> int:
+    """Sample a fee cap to create variation in the dataset."""
+    return rng.choices(
+        population=[5, 10, 20, 30, 50, 80, 120, 200],
+        weights=[0.06, 0.10, 0.20, 0.20, 0.18, 0.14, 0.08, 0.04],
+        k=1,
+    )[0]
+
+
+def choose_pricing_policy(rng: random.Random) -> str:
+    """Sample a pricing policy to avoid a constant pricing_policy column."""
+    return rng.choices(
+        population=["recent_fee", "sample_under_cap", "cap_max"],
+        weights=[0.30, 0.50, 0.20],
+        k=1,
+    )[0]
+
+
+def choose_tx_variant(rng: random.Random) -> dict[str, Any]:
+    """
+    Choose a harmless transaction shape variant.
+
+    Returns a dict with:
+        tx_variant: str
+        memo_text: str
+        extra_transfer_count: int
+    """
+    variant = rng.choices(
+        population=[
+            "plain",
+            "memo_small",
+            "memo_medium",
+            "memo_large",
+            "memo_small_plus_extra_transfer",
+        ],
+        weights=[0.22, 0.22, 0.22, 0.18, 0.16],
+        k=1,
+    )[0]
+
+    if variant == "plain":
+        return {
+            "tx_variant": variant,
+            "memo_text": "",
+            "extra_transfer_count": 0,
+        }
+
+    if variant == "memo_small":
+        return {
+            "tx_variant": variant,
+            "memo_text": "x" * 16,
+            "extra_transfer_count": 0,
+        }
+
+    if variant == "memo_medium":
+        return {
+            "tx_variant": variant,
+            "memo_text": "m" * 64,
+            "extra_transfer_count": 0,
+        }
+
+    if variant == "memo_large":
+        return {
+            "tx_variant": variant,
+            "memo_text": "l" * 160,
+            "extra_transfer_count": 0,
+        }
+
+    return {
+        "tx_variant": variant,
+        "memo_text": "e" * 32,
+        "extra_transfer_count": 1,
+    }
+
+
+def snapshot_network_for_accounts(
+    client: SolanaRpcClient,
+    writable_accounts: list[str],
+) -> dict[str, float]:
+    """
+    Collect account-conditioned prioritization fee statistics.
+
+    Falls back to zeros if the RPC returns no account-specific fee samples.
+    """
+    fee_samples = client.get_recent_prioritization_fees(writable_accounts=writable_accounts)
+    fees = [float(item.get("prioritizationFee", 0.0)) for item in fee_samples]
+    if not fees:
+        fees = [0.0]
+
+    return {
+        "local_recent_fee_min": float(np.min(fees)),
+        "local_recent_fee_median": float(np.median(fees)),
+        "local_recent_fee_p90": float(np.quantile(fees, 0.90)),
+        "local_recent_fee_max": float(np.max(fees)),
+    }
 
 
 def utc_now_iso() -> str:
@@ -330,157 +459,6 @@ def add_calendar_features(
     enriched["day_of_week"] = enriched[timestamp_column].dt.dayofweek.astype(int)
     return enriched
 
-
-def generate_synthetic_demo_dataset(
-    n_rows: int = 12_000,
-    random_state: int = 42,
-) -> pd.DataFrame:
-    rng = np.random.default_rng(random_state)
-    timestamps = pd.date_range(
-        start="2026-01-01",
-        periods=n_rows,
-        freq="5min",
-        tz="UTC",
-    )
-
-    base_load = 0.55 + 0.25 * np.sin(np.linspace(0, 30 * np.pi, n_rows))
-    shock = rng.normal(0.0, 0.10, n_rows)
-    congestion = np.clip(base_load + shock, 0.05, 0.98)
-
-    send_method = rng.choice(
-        ["rpc", "tpu", "both"],
-        size=n_rows,
-        p=[0.55, 0.18, 0.27],
-    )
-    cu_limit = rng.choice(
-        [120_000, 160_000, 200_000, 250_000, 300_000],
-        size=n_rows,
-        p=[0.10, 0.20, 0.35, 0.20, 0.15],
-    )
-    recent_fee_median = np.maximum(0, rng.lognormal(mean=2.8 + 1.2 * congestion, sigma=0.35))
-    recent_fee_p90 = recent_fee_median * (1.15 + 0.80 * congestion)
-    recent_fee_min = np.maximum(0.0, recent_fee_median * (0.25 + 0.10 * rng.random(n_rows)))
-    recent_fee_max = recent_fee_p90 * (1.15 + 0.50 * rng.random(n_rows))
-
-    fee_ratio = rng.choice(
-        [0.55, 0.75, 0.90, 1.00, 1.15, 1.35, 1.60],
-        size=n_rows,
-        p=[0.05, 0.12, 0.18, 0.24, 0.18, 0.14, 0.09],
-    )
-    cu_price = np.maximum(1, np.round(recent_fee_p90 * fee_ratio + rng.normal(0, 5, n_rows))).astype(int)
-
-    message_size_bytes = rng.integers(180, 1100, n_rows)
-    instruction_count = rng.integers(2, 14, n_rows)
-    account_count = rng.integers(4, 40, n_rows)
-    writable_account_count = np.minimum(
-        account_count,
-        rng.integers(2, 18, n_rows),
-    )
-    fee_cap_lamports = rng.choice(
-        [5, 10, 20, 30, 50, 80],
-        size=n_rows,
-        p=[0.10, 0.18, 0.28, 0.22, 0.16, 0.06],
-    )
-
-    priority_fee_lamports = np.array(
-        [compute_priority_fee_lamports(limit, price) for limit, price in zip(cu_limit, cu_price)]
-    )
-
-    recent_tps = np.round(1700 + 2300 * congestion + rng.normal(0, 120, n_rows), 2)
-    recent_slots_per_second = np.round(2.2 + 0.5 * (1 - congestion) + rng.normal(0, 0.05, n_rows), 3)
-
-    send_bonus = np.select(
-        [send_method == "rpc", send_method == "tpu", send_method == "both"],
-        [0.0, 0.18, 0.26],
-        default=0.0,
-    )
-    fee_position = np.log1p(cu_price) - np.log1p(recent_fee_p90)
-    size_penalty = 0.0012 * (message_size_bytes - 350)
-    instruction_penalty = 0.05 * (instruction_count - 5)
-    writable_penalty = 0.025 * (writable_account_count - 6)
-    cap_penalty = (priority_fee_lamports > fee_cap_lamports).astype(float) * 1.7
-
-    latent_score = (
-        -1.1
-        + 2.4 * fee_position
-        + 1.9 * send_bonus
-        - 2.0 * congestion
-        - 0.005 * np.maximum(0, cu_limit - 200_000) / 1_000
-        - size_penalty
-        - instruction_penalty
-        - writable_penalty
-        - cap_penalty
-        + rng.normal(0, 0.35, n_rows)
-    )
-
-    p_k3 = 1 / (1 + np.exp(-latent_score))
-    p_k2 = 1 / (1 + np.exp(-(latent_score - 0.55)))
-    p_k1 = 1 / (1 + np.exp(-(latent_score - 1.10)))
-
-    landed_k3 = rng.binomial(1, p_k3)
-    landed_k2 = rng.binomial(1, np.minimum(p_k2, p_k3))
-    landed_k1 = rng.binomial(1, np.minimum(p_k1, p_k2))
-    landed_k2 = np.maximum(landed_k2, landed_k1)
-    landed_k3 = np.maximum(landed_k3, landed_k2)
-
-    slot_delta = np.where(
-        landed_k3 == 1,
-        np.where(
-            landed_k1 == 1,
-            1,
-            np.where(landed_k2 == 1, 2, 3),
-        ),
-        rng.integers(4, 10, size=n_rows),
-    )
-
-    latency_ms = np.where(
-        landed_k3 == 1,
-        np.round(
-            120
-            + 250 * slot_delta
-            + 340 * congestion
-            + 0.18 * message_size_bytes
-            - 60 * send_bonus
-            - 35 * fee_position
-            + rng.normal(0, 55, n_rows),
-            2,
-        ),
-        np.round(
-            2000
-            + 900 * congestion
-            + rng.normal(0, 200, n_rows),
-            2,
-        ),
-    )
-    latency_ms = np.maximum(latency_ms, 40.0)
-
-    frame = pd.DataFrame(
-        {
-            "timestamp_utc": timestamps,
-            "send_method": send_method,
-            "cu_limit": cu_limit.astype(int),
-            "cu_price_micro_lamports": cu_price.astype(int),
-            "priority_fee_lamports": priority_fee_lamports.astype(int),
-            "fee_cap_lamports": fee_cap_lamports.astype(int),
-            "recent_fee_min": np.round(recent_fee_min, 2),
-            "recent_fee_median": np.round(recent_fee_median, 2),
-            "recent_fee_p90": np.round(recent_fee_p90, 2),
-            "recent_fee_max": np.round(recent_fee_max, 2),
-            "recent_tps": recent_tps,
-            "recent_slots_per_second": recent_slots_per_second,
-            "message_size_bytes": message_size_bytes.astype(int),
-            "instruction_count": instruction_count.astype(int),
-            "account_count": account_count.astype(int),
-            "writable_account_count": writable_account_count.astype(int),
-            "landed_within_1_slots": landed_k1.astype(int),
-            "landed_within_2_slots": landed_k2.astype(int),
-            "landed_within_3_slots": landed_k3.astype(int),
-            "latency_ms": latency_ms,
-            "slot_delta": slot_delta.astype(int),
-        }
-    )
-    frame = add_calendar_features(frame)
-    return frame
 
 
 def time_based_split(
@@ -925,9 +903,12 @@ def build_transaction(
     cu_limit: int,
     cu_price_micro_lamports: int,
     lamports: int,
-) -> tuple[VersionedTransaction, int, int, int, int]:
+    memo_text: str = "",
+    extra_transfer_count: int = 0,
+) -> tuple[VersionedTransaction, int, int, int, int, list[str], int, int]:
     ensure_solana_sdk()
-    instructions = [
+
+    instructions: list[Any] = [
         set_compute_unit_limit(cu_limit),
         set_compute_unit_price(cu_price_micro_lamports),
         transfer(
@@ -938,6 +919,21 @@ def build_transaction(
             )
         ),
     ]
+
+    if memo_text:
+        instructions.append(build_memo_instruction(memo_text))
+
+    for _ in range(extra_transfer_count):
+        instructions.append(
+            transfer(
+                TransferParams(
+                    from_pubkey=payer.pubkey(),
+                    to_pubkey=recipient,
+                    lamports=lamports,
+                )
+            )
+        )
+
     message = MessageV0.try_compile(
         payer=payer.pubkey(),
         instructions=instructions,
@@ -948,14 +944,27 @@ def build_transaction(
 
     account_keys = list(message.account_keys)
     writable_count = 0
+    writable_accounts: list[str] = []
     for idx in range(len(account_keys)):
         if message.is_maybe_writable(idx):
             writable_count += 1
+            writable_accounts.append(str(account_keys[idx]))
 
     message_size_bytes = len(bytes(tx))
     instruction_count = len(instructions)
     account_count = len(account_keys)
-    return tx, message_size_bytes, instruction_count, account_count, writable_count
+    memo_size_bytes = len(memo_text.encode("utf-8")) if memo_text else 0
+
+    return (
+        tx,
+        message_size_bytes,
+        instruction_count,
+        account_count,
+        writable_count,
+        writable_accounts,
+        memo_size_bytes,
+        extra_transfer_count,
+    )
 
 
 def poll_for_landing(
@@ -1018,15 +1027,15 @@ def collect_real_transactions(
     recipient: str | None = None,
     num_samples: int = 200,
     lamports: int = 1,
-    fee_cap_lamports: int = 20,
+    fee_cap_lamports: int | None = None,
     poll_interval_seconds: float = 0.50,
     timeout_seconds: float = 45.0,
     sleep_seconds: float = 1.0,
     random_seed: int = 42,
     print_progress: bool = True,
-    pricing_policy: str = "sample_under_cap",
+    pricing_policy: str | None = None,
 ) -> Path:
-    """Collect a real transaction dataset and append rows to a CSV file."""
+    """Collect a richer real transaction dataset and append rows to a CSV file."""
     ensure_solana_sdk()
     rng = random.Random(random_seed)
     rpc = SolanaRpcClient(rpc_url)
@@ -1039,6 +1048,7 @@ def collect_real_transactions(
         "timestamp_utc",
         "send_method",
         "pricing_policy",
+        "tx_variant",
         "cu_limit",
         "cu_price_micro_lamports",
         "priority_fee_lamports",
@@ -1047,12 +1057,19 @@ def collect_real_transactions(
         "recent_fee_median",
         "recent_fee_p90",
         "recent_fee_max",
+        "local_recent_fee_min",
+        "local_recent_fee_median",
+        "local_recent_fee_p90",
+        "local_recent_fee_max",
         "recent_tps",
         "recent_slots_per_second",
         "message_size_bytes",
         "instruction_count",
         "account_count",
         "writable_account_count",
+        "memo_size_bytes",
+        "extra_transfer_count",
+        "lamports",
         "landed_within_1_slots",
         "landed_within_2_slots",
         "landed_within_3_slots",
@@ -1067,27 +1084,47 @@ def collect_real_transactions(
     ensure_csv_header(output, fieldnames)
 
     for idx in range(num_samples):
-        snapshot = rpc.snapshot_network()
+        sampled_fee_cap = fee_cap_lamports if fee_cap_lamports is not None else choose_fee_cap_lamports(rng)
+        sampled_pricing_policy = pricing_policy if pricing_policy is not None else choose_pricing_policy(rng)
+        tx_shape = choose_tx_variant(rng)
         cu_limit = choose_cu_limit(rng)
+
+        snapshot = rpc.snapshot_network()
         cu_price = choose_micro_lamports_price(
             rng=rng,
             snapshot=snapshot,
             cu_limit=cu_limit,
-            fee_cap_lamports=fee_cap_lamports,
-            pricing_policy=pricing_policy,
+            fee_cap_lamports=sampled_fee_cap,
+            pricing_policy=sampled_pricing_policy,
         )
         priority_fee = compute_priority_fee_lamports(cu_limit, cu_price)
 
         latest_blockhash_resp = client.get_latest_blockhash()
         recent_blockhash = latest_blockhash_resp.value.blockhash
 
-        tx, message_size_bytes, instruction_count, account_count, writable_count = build_transaction(
+        (
+            tx,
+            message_size_bytes,
+            instruction_count,
+            account_count,
+            writable_count,
+            writable_accounts,
+            memo_size_bytes,
+            extra_transfer_count,
+        ) = build_transaction(
             payer=payer,
             recipient=recipient_pubkey,
             recent_blockhash=recent_blockhash,
             cu_limit=cu_limit,
             cu_price_micro_lamports=cu_price,
             lamports=lamports,
+            memo_text=tx_shape["memo_text"],
+            extra_transfer_count=tx_shape["extra_transfer_count"],
+        )
+
+        local_fee_snapshot = snapshot_network_for_accounts(
+            client=rpc,
+            writable_accounts=writable_accounts,
         )
 
         sent_at_utc = utc_now_iso()
@@ -1112,21 +1149,29 @@ def collect_real_transactions(
         row = {
             "timestamp_utc": sent_at_utc,
             "send_method": "rpc",
-            "pricing_policy": pricing_policy,
+            "pricing_policy": sampled_pricing_policy,
+            "tx_variant": tx_shape["tx_variant"],
             "cu_limit": cu_limit,
             "cu_price_micro_lamports": cu_price,
             "priority_fee_lamports": priority_fee,
-            "fee_cap_lamports": fee_cap_lamports,
+            "fee_cap_lamports": sampled_fee_cap,
             "recent_fee_min": snapshot.recent_fee_min,
             "recent_fee_median": snapshot.recent_fee_median,
             "recent_fee_p90": snapshot.recent_fee_p90,
             "recent_fee_max": snapshot.recent_fee_max,
+            "local_recent_fee_min": local_fee_snapshot["local_recent_fee_min"],
+            "local_recent_fee_median": local_fee_snapshot["local_recent_fee_median"],
+            "local_recent_fee_p90": local_fee_snapshot["local_recent_fee_p90"],
+            "local_recent_fee_max": local_fee_snapshot["local_recent_fee_max"],
             "recent_tps": snapshot.recent_tps,
             "recent_slots_per_second": snapshot.recent_slots_per_second,
             "message_size_bytes": message_size_bytes,
             "instruction_count": instruction_count,
             "account_count": account_count,
             "writable_account_count": writable_count,
+            "memo_size_bytes": memo_size_bytes,
+            "extra_transfer_count": extra_transfer_count,
+            "lamports": lamports,
             "landed_within_1_slots": int(slot_delta is not None and slot_delta <= 1),
             "landed_within_2_slots": int(slot_delta is not None and slot_delta <= 2),
             "landed_within_3_slots": int(slot_delta is not None and slot_delta <= 3),
@@ -1142,10 +1187,18 @@ def collect_real_transactions(
 
         if print_progress:
             print(
-                f"[{idx + 1}/{num_samples}] sig={signature} cu_limit={cu_limit} "
-                f"cu_price={cu_price} priority_fee={priority_fee} slot_delta={slot_delta} "
+                f"[{idx + 1}/{num_samples}] "
+                f"sig={signature} "
+                f"policy={sampled_pricing_policy} "
+                f"variant={tx_shape['tx_variant']} "
+                f"fee_cap={sampled_fee_cap} "
+                f"cu_limit={cu_limit} "
+                f"cu_price={cu_price} "
+                f"priority_fee={priority_fee} "
+                f"slot_delta={slot_delta} "
                 f"latency_ms={row['latency_ms']:.1f}"
             )
+
         time.sleep(sleep_seconds)
 
     return output
@@ -1191,14 +1244,14 @@ def cli_main() -> None:
     collect_parser.add_argument("--output", default="real_transactions.csv", type=Path)
     collect_parser.add_argument("--num-samples", default=200, type=int)
     collect_parser.add_argument("--lamports", default=1, type=int)
-    collect_parser.add_argument("--fee-cap-lamports", default=20, type=int)
+    collect_parser.add_argument("--fee-cap-lamports", default=None, type=int)
     collect_parser.add_argument("--poll-interval-seconds", default=0.50, type=float)
     collect_parser.add_argument("--timeout-seconds", default=45.0, type=float)
     collect_parser.add_argument("--sleep-seconds", default=1.0, type=float)
     collect_parser.add_argument("--random-seed", default=42, type=int)
     collect_parser.add_argument(
         "--pricing-policy",
-        default="sample_under_cap",
+        default=None,
         choices=["recent_fee", "sample_under_cap", "cap_max"],
     )
 
