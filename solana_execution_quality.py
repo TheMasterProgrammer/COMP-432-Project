@@ -738,14 +738,36 @@ def summarize_congestion_regimes(
     target_column: str = "landed_within_3_slots",
 ) -> pd.DataFrame:
     working = frame.copy()
-    working["regime"] = pd.qcut(
-        working["recent_fee_p90"],
-        q=3,
-        labels=["low", "medium", "high"],
-        duplicates="drop",
+    def _choose_signal(column_names: list[str]) -> tuple[pd.Series, str]:
+        for column_name in column_names:
+            if column_name not in working.columns:
+                continue
+            series = pd.to_numeric(working[column_name], errors="coerce")
+            if series.dropna().nunique() > 1:
+                return series, column_name
+        return pd.Series(np.nan, index=working.index, dtype=float), "none"
+
+    signal, signal_source = _choose_signal(
+        ["recent_fee_p90", "recent_tps", "recent_slots_per_second"]
     )
-    return (
-        working.groupby("regime", observed=False)
+    valid_signal = signal.dropna()
+
+    if valid_signal.empty:
+        working["regime"] = "unknown"
+    else:
+        ranked_signal = signal.rank(method="first")
+        working["regime"] = pd.qcut(
+            ranked_signal,
+            q=3,
+            labels=["low", "medium", "high"],
+            duplicates="drop",
+        )
+        working["regime"] = working["regime"].astype(object)
+        working.loc[signal.isna(), "regime"] = "unknown"
+
+    regime_order = ["low", "medium", "high", "flat", "unknown"]
+    summary = (
+        working.groupby("regime", observed=True)
         .agg(
             n=(target_column, "size"),
             success_rate=(target_column, "mean"),
@@ -754,6 +776,9 @@ def summarize_congestion_regimes(
         )
         .reset_index()
     )
+    summary["regime_signal"] = signal_source
+    summary["regime"] = pd.Categorical(summary["regime"], categories=regime_order, ordered=True)
+    return summary.sort_values("regime").reset_index(drop=True)
 
 
 def plot_probability_histogram(
